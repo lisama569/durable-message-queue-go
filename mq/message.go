@@ -115,6 +115,8 @@ var (
 	ErrInvalidArgument    = mqError("invalid argument")
 	ErrConsumerRegistered = mqError("consumer already registered in group")
 	ErrUnknownConsumer    = mqError("unknown consumer")
+	ErrReplayNotFound     = mqError("replay operation not found")
+	ErrNothingToReplay    = mqError("no dead-letter matched the replay filter")
 )
 
 type mqError string

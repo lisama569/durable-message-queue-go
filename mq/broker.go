@@ -50,6 +50,7 @@ type Broker struct {
 	tps      []TopicPartition
 	groups   map[string]*group
 	retries  *retryStore
+	replays  *replayStore
 	inflight map[gt]map[int64]*inflight
 	// deliveredHi[gt] = 该组×分区“已投递过”的连续上界（下一条从未投递的位移）。
 	// 提交位绝不允许越过它：否则未投递消息会被静默跳过。
@@ -83,6 +84,10 @@ func NewBroker(cfg Config) (*Broker, error) {
 	if err != nil {
 		return nil, err
 	}
+	rps, err := newReplayStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	b := &Broker{
 		cfg:         cfg,
 		clock:       cfg.Clock,
@@ -90,9 +95,11 @@ func NewBroker(cfg Config) (*Broker, error) {
 		logs:        map[TopicPartition]*PartitionLog{},
 		groups:      map[string]*group{},
 		retries:     rs,
+		replays:     rps,
 		inflight:    map[gt]map[int64]*inflight{},
 		deliveredHi: map[gt]int64{},
 	}
+	b.replays.reconcile(rs)
 	return b, nil
 }
 
@@ -587,4 +594,206 @@ func (b *Broker) Assignments(groupName string) map[TopicPartition]string {
 // DeadLetters 读取某组的死信记录。
 func (b *Broker) DeadLetters(groupName string) []DLQEntry {
 	return b.retries.deadLetters(groupName)
+}
+
+// ReplayDeadLetters 触发某消费组的死信重投（按 filter 筛选）。
+// idemKey 为调用方提供的幂等键：相同 (group, idemKey) 的重复调用、以及
+// 进程重启后的再次调用，只会恢复并继续同一个操作，绝不重复入队。
+//
+// 重投消息以【新记录】追加到同分区日志尾部，因此：
+//   - 已提交/已确认的其他消息（含原死信位移）绝不会被再投一遍，位移不回退；
+//   - 重投消息天然排在同分区所有现有消息之后，后续消息不会跑到它前面；
+//   - 它像正常消息一样被该组消费，并重新获得完整的 MaxAttempts 重试机会；
+//   - 原始来源、失败次数与完整原因链保留在消息头（见 ParseReplayProvenance）。
+//
+// 受分区容量反压：装不下时返回 ErrQueueFull，已入队部分不回滚，调用方稍后
+// 用 ResumeReplay 续跑；不会静默丢弃，也不会重复入队。
+func (b *Broker) ReplayDeadLetters(groupName, idemKey string, filter ReplayFilter) (ReplayResult, error) {
+	if groupName == "" {
+		return ReplayResult{}, ErrInvalidArgument
+	}
+	now := b.clock.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if idemKey == "" {
+		b.seq++
+		idemKey = "auto-" + newOpID(now, b.seq)
+	}
+
+	// 幂等：同组同键重复/重启后调用 -> 恢复并继续既有操作。
+	if op, ok := b.replays.findByIdempotency(groupName, idemKey); ok {
+		b.logf("[replay] group=%s key=%s status=resume-existing op=%s", groupName, idemKey, op.OpID)
+		return b.resumeReplayLocked(op.OpID)
+	}
+
+	dead := b.retries.deadLetters(groupName)
+	candidates := selectReplayCandidates(dead, filter)
+	res := ReplayResult{Matched: len(candidates)}
+	if len(candidates) == 0 {
+		b.logf("[replay] group=%s key=%s status=empty reason=no-match", groupName, idemKey)
+		return res, ErrNothingToReplay
+	}
+
+	b.seq++
+	op, claimed := b.replays.createReplay(b.retries, groupName, idemKey, candidates, now, b.seq)
+	if snap, ok := b.replays.getOp(op.OpID); ok {
+		res.Operation = snap
+	}
+	b.logf("[replay] op=%s group=%s key=%s matched=%d claimed=%d status=created",
+		op.OpID, groupName, idemKey, len(candidates), len(claimed))
+
+	enqueued, already, runErr := b.runReplayLocked(op.OpID)
+	res.EnqueuedNow = enqueued
+	res.AlreadyDone = already
+	if snap, ok := b.replays.getOp(op.OpID); ok {
+		res.Operation = snap
+	}
+	return res, runErr
+}
+
+// ResumeReplay 继续推进一个未完成的重投操作（容量恢复后调用，或重启后续跑）。
+func (b *Broker) ResumeReplay(opID string) (ReplayResult, error) {
+	if opID == "" {
+		return ReplayResult{}, ErrInvalidArgument
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.resumeReplayLocked(opID)
+}
+
+func (b *Broker) resumeReplayLocked(opID string) (ReplayResult, error) {
+	op, ok := b.replays.getOp(opID)
+	if !ok {
+		return ReplayResult{}, ErrReplayNotFound
+	}
+	res := ReplayResult{Operation: op, Matched: len(op.Items)}
+	enqueued, already, err := b.runReplayLocked(opID)
+	res.EnqueuedNow = enqueued
+	res.AlreadyDone = already
+	if snap, ok := b.replays.getOp(opID); ok {
+		res.Operation = snap
+	}
+	return res, err
+}
+
+// runReplayLocked 串行推进操作中所有未完成条目。
+// 返回 (本次新确认入队数, 恢复时发现此前已入队数, 首个阻塞错误)。
+// 所有重投入队在此按 (分区, 原始位移) 顺序串行完成，保证同分区顺序确定。
+func (b *Broker) runReplayLocked(opID string) (int, int, error) {
+	now := b.clock.Now()
+	op, ok := b.replays.getOp(opID)
+	if !ok {
+		return 0, 0, ErrReplayNotFound
+	}
+	enqueuedNow, alreadyDone := 0, 0
+	for idx := range op.Items {
+		item := op.Items[idx]
+		if item.Status == ReplayComplete {
+			alreadyDone++
+			continue
+		}
+		tp := item.tp()
+		l, exists := b.logs[tp]
+		if !exists {
+			b.replays.markItemError(opID, item, ErrPartitionNotFound.Error(), b.clock.Now())
+			return enqueuedNow, alreadyDone, ErrPartitionNotFound
+		}
+
+		// 幂等探测：扫描扫描起点之后的日志，若本操作的重投副本此前已写入
+		// （写入后、标记前崩溃），直接认领该记录，绝不重复追加。
+		if _, newOff, found := b.findReplayRecordLocked(l, opID, tp, item.OriginOffset, item.ScanFrom); found {
+			b.retries.markReplayedEnqueued(op.Group, opID, tp, item.OriginOffset, newOff, b.clock.Now())
+			done := ReplayItem(item)
+			done.Status = ReplayComplete
+			done.NewOffset = newOff
+			b.replays.markEnqueued(opID, done, b.clock.Now())
+			alreadyDone++
+			b.logf("[replay] op=%s id=%s#%s status=recovered-existing new-offset=%s",
+				opID, tp.String(), itoa64(item.OriginOffset), itoa64(newOff))
+			op, _ = b.replays.getOp(opID)
+			continue
+		}
+
+		// 预留新位移，先把账本落到“已预留”，再追加日志（崩溃窗口由上面的探测兜底）。
+		newOff := l.endOffset()
+		if newOff >= int64(l.capacity) {
+			b.replays.markItemError(opID, item, ErrQueueFull.Error(), b.clock.Now())
+			b.logf("[replay] op=%s id=%s#%s status=backpressure offset=%s reason=queue-full",
+				opID, tp.String(), itoa64(item.OriginOffset), itoa64(newOff))
+			return enqueuedNow, alreadyDone, ErrQueueFull
+		}
+		reserved := ReplayItem(item)
+		reserved.NewOffset = newOff
+		b.replays.markReserved(opID, reserved, now)
+
+		dead, found := b.retries.deadEntry(op.Group, tp, item.OriginOffset)
+		if !found {
+			// 死信记录丢失（数据被外部清理）：不能凭空重投，报错保留现场。
+			b.replays.markItemError(opID, item, "dead-letter record missing", b.clock.Now())
+			return enqueuedNow, alreadyDone, ErrInvalidArgument
+		}
+		msg := buildReplayMessage(opID, dead, now)
+		rec, err := l.Append(msg)
+		if err != nil {
+			b.replays.markItemError(opID, item, err.Error(), b.clock.Now())
+			b.logf("[replay] op=%s id=%s#%s status=append-failed err=%v",
+				opID, tp.String(), itoa64(item.OriginOffset), err)
+			return enqueuedNow, alreadyDone, err
+		}
+
+		// 追加已 fsync：提交死信表与账本的“已入队”状态。
+		b.retries.markReplayedEnqueued(op.Group, opID, tp, item.OriginOffset, rec.Offset, b.clock.Now())
+		done := ReplayItem(item)
+		done.Status = ReplayComplete
+		done.NewOffset = rec.Offset
+		b.replays.markEnqueued(opID, done, b.clock.Now())
+		enqueuedNow++
+		b.logf("[replay] op=%s id=%s#%s status=enqueued new-offset=%s",
+			opID, tp.String(), itoa64(item.OriginOffset), itoa64(rec.Offset))
+
+		// 重新读取操作快照（markEnqueued 不改变条目数量与顺序）。
+		op, _ = b.replays.getOp(opID)
+	}
+	final, _ := b.replays.getOp(opID)
+	b.logf("[replay] op=%s status=%s enqueued=%d already=%d items=%d",
+		opID, string(final.Status),
+		enqueuedNow, alreadyDone, len(final.Items))
+	return enqueuedNow, alreadyDone, nil
+}
+
+// findReplayRecordLocked 在 [scanFrom, logEnd) 内查找属于本操作、源死信为
+// (tp, originOffset) 的已写入重投记录。
+func (b *Broker) findReplayRecordLocked(l *PartitionLog, opID string,
+	tp TopicPartition, originOffset, scanFrom int64) (Record, int64, bool) {
+	end := l.endOffset()
+	for off := scanFrom; off < end; off++ {
+		rec, ok := l.Read(off)
+		if !ok {
+			continue
+		}
+		prov, isReplay := ParseReplayProvenance(rec.Headers)
+		if !isReplay || prov.OpID != opID {
+			continue
+		}
+		if prov.OriginTopic == tp.Topic &&
+			prov.OriginPartition == tp.Partition &&
+			prov.OriginOffset == originOffset {
+			return rec, off, true
+		}
+	}
+	return Record{}, 0, false
+}
+
+// GetReplay 查询单个重投操作的当前状态（重启后亦可查询）。
+func (b *Broker) GetReplay(opID string) (ReplayOperation, error) {
+	if op, ok := b.replays.getOp(opID); ok {
+		return op, nil
+	}
+	return ReplayOperation{}, ErrReplayNotFound
+}
+
+// ListReplays 列出某消费组的全部重投操作（含已完成与未完成），按创建时间排序。
+func (b *Broker) ListReplays(groupName string) []ReplayOperation {
+	return b.replays.listOps(groupName)
 }

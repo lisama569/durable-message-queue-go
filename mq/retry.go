@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -62,6 +63,13 @@ type DLQEntry struct {
 	Attempts  int       `json:"attempts"`
 	Reasons   []string  `json:"reasons"`
 	DeadAt    time.Time `json:"dead_at"`
+
+	// 重投认领标记（死信重投功能）：
+	// ReplayedOpID 非空表示该死信已被某个重投操作认领，防止被重复入队；
+	// ReplayedNewOffset 为 -1 表示已认领但新消息尚未确认入队，>=0 为入队后的新位移。
+	ReplayedOpID      string    `json:"replayed_op_id,omitempty"`
+	ReplayedAt        time.Time `json:"replayed_at,omitempty"`
+	ReplayedNewOffset int64     `json:"replayed_new_offset,omitempty"`
 }
 
 // retryState 是持久化到磁盘的整体快照。
@@ -196,6 +204,97 @@ func (s *retryStore) deadLetters(group string) []DLQEntry {
 	defer s.mu.Unlock()
 	out := append([]DLQEntry(nil), s.dead[group]...)
 	return out
+}
+
+// groupNames 返回所有出现过死信/待重试的消费组名。
+func (s *retryStore) groupNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]struct{}{}
+	for g := range s.dead {
+		seen[g] = struct{}{}
+	}
+	for g := range s.pending {
+		seen[g] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for g := range seen {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// findDeadLocked 在某组死信列表中定位 (tp, offset)。
+func (s *retryStore) findDeadIndexLocked(group string, tp TopicPartition, offset int64) int {
+	for i := range s.dead[group] {
+		e := s.dead[group][i]
+		if e.Offset == offset && e.Topic == tp.Topic && e.Partition == tp.Partition {
+			return i
+		}
+	}
+	return -1
+}
+
+// claimDead 把一条死信标记为“被重投操作 opID 认领（尚未完成入队）”，
+// 并返回该死信的快照副本。
+// 若死信不存在、或已被另一个重投操作认领，则返回 ok=false（防御性：
+// 正常流程下 Broker 串行调用、候选已排除已认领项，不会走到这里）。
+func (s *retryStore) claimDead(group, opID string, tp TopicPartition, offset int64, now time.Time) (DLQEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.findDeadIndexLocked(group, tp, offset)
+	if i < 0 {
+		return DLQEntry{}, false
+	}
+	if existing := s.dead[group][i].ReplayedOpID; existing != "" && existing != opID {
+		return DLQEntry{}, false
+	}
+	s.dead[group][i].ReplayedOpID = opID
+	s.dead[group][i].ReplayedAt = now
+	s.dead[group][i].ReplayedNewOffset = -1
+	out := s.dead[group][i]
+	_ = s.persistLocked()
+	return out, true
+}
+
+// markReplayedEnqueued 记录重投消息已确认入队及其新位移。
+func (s *retryStore) markReplayedEnqueued(group, opID string, tp TopicPartition, offset, newOffset int64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.findDeadIndexLocked(group, tp, offset)
+	if i < 0 {
+		return
+	}
+	s.dead[group][i].ReplayedOpID = opID
+	s.dead[group][i].ReplayedAt = now
+	s.dead[group][i].ReplayedNewOffset = newOffset
+	_ = s.persistLocked()
+}
+
+// claimedDead 返回某组“已认领但尚未确认入队（新位移为 -1）”的死信，
+// 供重投账本在崩溃恢复时补全操作记录。
+func (s *retryStore) claimedDead(group string) []DLQEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []DLQEntry
+	for _, e := range s.dead[group] {
+		if e.ReplayedOpID != "" && e.ReplayedNewOffset < 0 {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// deadEntry 读取某组指定 (tp, offset) 的单条死信快照。
+func (s *retryStore) deadEntry(group string, tp TopicPartition, offset int64) (DLQEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.findDeadIndexLocked(group, tp, offset)
+	if i < 0 {
+		return DLQEntry{}, false
+	}
+	return s.dead[group][i], true
 }
 
 func (s *retryStore) findLocked(group string, tp TopicPartition, offset int64) (retryEntry, bool) {
