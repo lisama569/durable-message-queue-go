@@ -2,7 +2,10 @@ package mq
 
 import (
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,6 +53,7 @@ type Broker struct {
 	tps      []TopicPartition
 	groups   map[string]*group
 	retries  *retryStore
+	replays  *replayStore
 	inflight map[gt]map[int64]*inflight
 	// deliveredHi[gt] = 该组×分区“已投递过”的连续上界（下一条从未投递的位移）。
 	// 提交位绝不允许越过它：否则未投递消息会被静默跳过。
@@ -83,6 +87,10 @@ func NewBroker(cfg Config) (*Broker, error) {
 	if err != nil {
 		return nil, err
 	}
+	rps, err := newReplayStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	b := &Broker{
 		cfg:         cfg,
 		clock:       cfg.Clock,
@@ -90,10 +98,62 @@ func NewBroker(cfg Config) (*Broker, error) {
 		logs:        map[TopicPartition]*PartitionLog{},
 		groups:      map[string]*group{},
 		retries:     rs,
+		replays:     rps,
 		inflight:    map[gt]map[int64]*inflight{},
 		deliveredHi: map[gt]int64{},
 	}
+	if err := b.openExistingLogsLocked(); err != nil {
+		return nil, err
+	}
 	return b, nil
+}
+
+// openExistingLogsLocked 扫描 logs 目录恢复已有分区日志，
+// 使崩溃后待续跑的重投请求不必依赖再次 CreateTopic 即可定位分区。
+func (b *Broker) openExistingLogsLocked() error {
+	dir := filepath.Join(b.cfg.DataDir, "logs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, en := range entries {
+		if en.IsDir() {
+			continue
+		}
+		name := en.Name()
+		if !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		stem := strings.TrimSuffix(name, ".log")
+		i := strings.LastIndex(stem, "-")
+		if i < 0 {
+			continue
+		}
+		p, err := parseInt(stem[i+1:])
+		if err != nil {
+			continue
+		}
+		tp := TopicPartition{Topic: stem[:i], Partition: p}
+		if _, ok := b.logs[tp]; ok {
+			continue
+		}
+		l, err := newPartitionLog(tp, b.cfg.DataDir, b.cfg.PartCapacity)
+		if err != nil {
+			return err
+		}
+		b.logs[tp] = l
+		b.tps = append(b.tps, tp)
+	}
+	sort.Slice(b.tps, func(i, j int) bool {
+		if b.tps[i].Topic != b.tps[j].Topic {
+			return b.tps[i].Topic < b.tps[j].Topic
+		}
+		return b.tps[i].Partition < b.tps[j].Partition
+	})
+	return nil
 }
 
 func (b *Broker) logf(format string, args ...any) {
@@ -289,6 +349,11 @@ func (b *Broker) Poll(c *Consumer, max int) ([]Delivery, error) {
 		return nil, ErrUnknownConsumer
 	}
 
+	// 顺带续跑崩溃/反压后尚未完成的重投请求（失败不阻塞正常拉取）。
+	if err := b.resumePendingLocked(now); err != nil {
+		b.logf("[replay-resume] status=error err=%v", err)
+	}
+
 	var out []Delivery
 	for _, tp := range b.tps {
 		if len(out) >= max {
@@ -368,6 +433,13 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 			}
 			// 到期情况已在上面处理，且它必已投递过（off < hi），不在此首发。
 			break
+		}
+		// 已进死信的位移不是未决消息：重启后首发游标可能首次扫到它，
+		// 必须允许越过（其终态由死信记录表达），否则同分区后续消息会被永久挡住。
+		if _, dead := b.retries.deadAt(groupName, tp, off); dead {
+			hi = off + 1
+			b.deliveredHi[key] = hi
+			continue
 		}
 		// 投递窗口上限即反压信号：不丢弃，留到下次 Poll。
 		if len(set) >= b.cfg.MaxInflight {

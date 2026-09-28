@@ -109,6 +109,41 @@ func (l *PartitionLog) Append(m Message) (Record, error) {
 	if len(l.recs) >= l.capacity {
 		return Record{}, ErrQueueFull
 	}
+	rec, err := l.appendLocked(m)
+	if err != nil {
+		return Record{}, err
+	}
+	if err := l.file.Sync(); err != nil {
+		return Record{}, err
+	}
+	return rec, nil
+}
+
+// AppendMany 在同一把分区锁内原子地追加一批消息：
+// 容量只检查一次，要么整批获得连续位移，要么一条都不入队（ErrQueueFull）。
+// 供死信重投使用，避免与并发 Produce 交错造成“半批入队”。
+func (l *PartitionLog) AppendMany(msgs []Message) ([]Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if int64(len(l.recs)+len(msgs)) > int64(l.capacity) {
+		return nil, ErrQueueFull
+	}
+	out := make([]Record, 0, len(msgs))
+	for _, m := range msgs {
+		rec, err := l.appendLocked(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := l.file.Sync(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// appendLocked 写入一条记录并更新内存索引；调用方必须持有 l.mu。
+func (l *PartitionLog) appendLocked(m Message) (Record, error) {
 	rec := Record{
 		Topic:      l.tp.Topic,
 		Partition:  l.tp.Partition,
@@ -125,9 +160,6 @@ func (l *PartitionLog) Append(m Message) (Record, error) {
 		return Record{}, err
 	}
 	if _, err := l.file.Write(body); err != nil {
-		return Record{}, err
-	}
-	if err := l.file.Sync(); err != nil {
 		return Record{}, err
 	}
 	l.recs = append(l.recs, rec)
@@ -149,6 +181,13 @@ func (l *PartitionLog) Read(offset int64) (Record, bool) {
 
 // endOffset 返回下一条将分配的位移（加锁由调用方或内部使用）。
 func (l *PartitionLog) endOffset() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return int64(len(l.recs))
+}
+
+// len 返回当前日志条数（容量检查用）。
+func (l *PartitionLog) len() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return int64(len(l.recs))

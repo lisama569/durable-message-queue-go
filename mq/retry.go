@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,6 +63,12 @@ type DLQEntry struct {
 	Attempts  int       `json:"attempts"`
 	Reasons   []string  `json:"reasons"`
 	DeadAt    time.Time `json:"dead_at"`
+	// Replayed 标记该死信是否已被某次重投请求处理过（死信记录本身保留以便审计）。
+	Replayed bool `json:"replayed"`
+	// ReplayID 为处理该死信的重投请求 ID（未重投为空）。
+	ReplayID string `json:"replay_id"`
+	// Origin 在“重投消息再次进死信”时保留其上一跳的完整来源；原始消息为空。
+	Origin *ReplayOrigin `json:"origin,omitempty"`
 }
 
 // retryState 是持久化到磁盘的整体快照。
@@ -138,6 +145,13 @@ func (s *retryStore) schedule(e retryEntry, rec Record, policy RetryPolicy, now 
 			Reasons:   reasons,
 			DeadAt:    now,
 		}
+		// 若本次进死信的是“重投消息”，挂接上一跳的完整来源（失败次数、
+		// 原始位移、历次原因、原始生产时间），并把上一跳原因链拼到本次链前，
+		// 形成跨重投周期可追溯的完整失败史。
+		if o := originFromHeaders(rec.Headers); o != nil {
+			dlq.Origin = o
+			dlq.Reasons = append(append([]string(nil), o.Reasons...), dlq.Reasons...)
+		}
 		s.dead[e.Group] = append(s.dead[e.Group], dlq)
 		if err := s.persistLocked(); err != nil {
 			return err
@@ -198,6 +212,29 @@ func (s *retryStore) deadLetters(group string) []DLQEntry {
 	return out
 }
 
+// findDead 按 (组×分区×位移) 查找单条死信（重投组装新记录时取原始快照）。
+func (s *retryStore) findDead(group string, k deadKey) (DLQEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.findDeadLocked(group, k)
+}
+
+// deadAt 判断某位移是否已处于死信终态。
+func (s *retryStore) deadAt(group string, tp TopicPartition, offset int64) (DLQEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.findDeadLocked(group, deadKey{tp: tp, offset: offset})
+}
+
+func (s *retryStore) findDeadLocked(group string, k deadKey) (DLQEntry, bool) {
+	for _, d := range s.dead[group] {
+		if d.Offset == k.offset && d.Record.topicPartition() == k.tp {
+			return d, true
+		}
+	}
+	return DLQEntry{}, false
+}
+
 func (s *retryStore) findLocked(group string, tp TopicPartition, offset int64) (retryEntry, bool) {
 	return s.findInListLocked(s.pending[group], tp, offset)
 }
@@ -243,4 +280,100 @@ func (s *retryStore) persistLocked() error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+// deadKey 唯一标识某组死信列表中的一条死信（同组内 组×分区×位移 唯一）。
+type deadKey struct {
+	tp     TopicPartition
+	offset int64
+}
+
+// selectDead 按筛选条件挑选某组尚未被重投、也不处于 skip 集合
+// （已被其它待完成重投请求认领）中的死信，顺序按 主题、分区、位移 稳定排列。
+// 注意：调用方必须持有 broker 主锁，以保证“挑选—认领”与并发重投互斥。
+func (s *retryStore) selectDead(group string, f ReplayFilter, skip map[deadKey]bool) []DLQEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	partSet := map[int]bool{}
+	for _, p := range f.Partitions {
+		partSet[p] = true
+	}
+	offSet := map[int64]bool{}
+	for _, o := range f.Offsets {
+		offSet[o] = true
+	}
+	var out []DLQEntry
+	for _, d := range s.dead[group] {
+		if d.Replayed || skip[deadKey{tp: d.Record.topicPartition(), offset: d.Offset}] {
+			continue
+		}
+		if f.Topic != "" && d.Topic != f.Topic {
+			continue
+		}
+		if len(partSet) > 0 && !partSet[d.Partition] {
+			continue
+		}
+		if len(offSet) > 0 && !offSet[d.Offset] {
+			continue
+		}
+		if !f.DeadAtFrom.IsZero() && d.DeadAt.Before(f.DeadAtFrom) {
+			continue
+		}
+		if !f.DeadAtTo.IsZero() && d.DeadAt.After(f.DeadAtTo) {
+			continue
+		}
+		if f.FailureReason != "" && !containsReason(d.Reasons, f.FailureReason) {
+			continue
+		}
+		out = append(out, d)
+	}
+	sortDead(out)
+	return out
+}
+
+func containsReason(reasons []string, sub string) bool {
+	for _, r := range reasons {
+		if strings.Contains(r, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func sortDead(list []DLQEntry) {
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && lessDead(list[j-1], list[j]); j-- {
+			list[j-1], list[j] = list[j], list[j-1]
+		}
+	}
+}
+
+func lessDead(a, b DLQEntry) bool {
+	if a.Topic != b.Topic {
+		return a.Topic > b.Topic
+	}
+	if a.Partition != b.Partition {
+		return a.Partition > b.Partition
+	}
+	return a.Offset > b.Offset
+}
+
+// markReplayed 把指定死信标记为“已由 requestID 重投”。死信记录本身保留，
+// 以保证 DeadLetters 审计与原因链可追溯。
+func (s *retryStore) markReplayed(group, requestID string, keys []deadKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := map[deadKey]bool{}
+	for _, k := range keys {
+		want[k] = true
+	}
+	list := s.dead[group]
+	for i := range list {
+		k := deadKey{tp: list[i].Record.topicPartition(), offset: list[i].Offset}
+		if want[k] {
+			list[i].Replayed = true
+			list[i].ReplayID = requestID
+		}
+	}
+	return s.persistLocked()
 }
