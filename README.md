@@ -15,7 +15,25 @@ go test -cover ./...
 
 # 只验证死信重投相关行为（筛选/幂等/反压/崩溃恢复/再次失败）
 go test -race -count=1 -run 'Replay' ./...
+
+# 只验证“死信终态在重启/接管后保持”与“并发触发+查询无竞争”
+go test -race -count=1 -run 'DeadLetterTerminal|ReplayConcurrentTriggerAndQuery' -v ./...
 ```
+
+本地复现/验证这两类故障演练问题的建议顺序：
+
+1. **死信前压着未确认消息 + 崩溃重启**：`TestDeadLetterTerminalAcrossRestart`
+   先在同一批投递里让 offset1 连续失败进死信、offset0 故意不确认（提交位停在 0），
+   `Close` 后用同一 `DataDir` 新建 Broker 并重新入组。断言重启后只重投 offset0、
+   首发 offset2，**offset1 永不出现**；Ack 后提交位能越过死信推进到日志末尾；
+   `DeadLetters("g")` 始终只有 1 条且指向原位移。
+2. **租约过期被接管**：`TestDeadLetterTerminalAcrossTakeover` 同样的在途布局下
+   推进可控时钟超过 `LeaseTTL` 并 `Step()`，由同组新消费者接管。断言在途 offset0
+   回收重投给新主、offset1 不复活、offset2 正常首发，旧主迟到 Ack 被会话栅栏拒绝。
+3. **并发触发/续跑/查询**：`TestReplayConcurrentTriggerAndQuery` 起多个 goroutine
+   用同一幂等键并发触发，同时并发 `GetReplay/ListReplays` 并校验每个快照自洽
+   （status 与 items 一致、完成条目位移非负），`-race` 下必须通过，最终只有
+   1 个操作、每个重投副本只入队一次。
 
 测试打开 `mq.Logger` 后会把判定过程打印到日志，每条日志都带**消息标识**
 `topic-partition#offset`、**位移**与**判定依据**，例如：
@@ -48,6 +66,9 @@ go test -race -count=1 -run 'Replay' ./...
 | `TestRetryThenSuccess` / `TestDeadLetter` | 确定性退避重试、超限进死信并保留原因链 |
 | `TestRetryBackoffDeterministic` | 退避数值确定、可复现 |
 | `TestRestartDLQAndOffsets` | 重启后消息日志、位移、死信均从磁盘恢复 |
+| `TestDeadLetterTerminalAcrossRestart` | 死信前面还压着未确认消息时崩溃重启：原死信位移不再投、不重复入死信，提交位越过死信推进，未确认/新消息不被跳过 |
+| `TestDeadLetterTerminalAcrossTakeover` | 同样布局下租约过期被同组消费者接管：在途回收重投、死信终态保持、旧主迟到确认被栅栏拒绝 |
+| `TestReplayConcurrentTriggerAndQuery` | 多调用方并发触发/续跑重投并同时 `GetReplay/ListReplays`：`-race` 下无竞争，查询只返回推进前/后的完整自洽快照 |
 | `TestReplayFilterAndRedeliver` | 按分区/位移/原因/时间范围筛选死信重投；副本追加尾部、溯源完整、顺序不乱 |
 | `TestReplayIdempotent` / `TestReplayConcurrentIdempotent` | 同幂等键重复/并发触发只恢复同一操作，绝不重复入队 |
 | `TestReplayBackpressureAndResume` / `TestReplayRestartRecoversCompleteOp` | 容量满 `ErrQueueFull` 反压、续跑补齐、重启恢复 pending/complete 操作 |
@@ -103,7 +124,7 @@ go test -race -count=1 -run 'Replay' ./...
   提交位永远不会越过投递游标，因此即使窗口分批取走消息，也不会把
   从未投递的消息当作已消费而跳过。
 
-### 3.3 至少一次与重启恢复
+### 3.3 至少一次、死信终态与重启/接管恢复
 
 - 整体为 **at-least-once**：未确认或确认落后于提交位的消息，在重启或易主后
   一定会被重新投递；消费成功的幂等性由业务侧结合消息标识保证。
@@ -111,6 +132,21 @@ go test -race -count=1 -run 'Replay' ./...
   待重试与死信从 `retries.json` 恢复。成员与独占关系属于租约态，重启后失效，
   消费者需重新加入。
 - 所有元数据写入均采用“临时文件 + 原子 rename”。
+- **死信位移是严格终态，对任何游标回退都成立。** 投递扫描在三种情况下都可能
+  从早于某条死信的位置重新开始：
+  1. 进程重启后投递游标从已提交位重建；
+  2. 消费者崩溃 / `LeaveGroup` / 心跳超时被接管，在途被回收、游标回退到提交位；
+  3. 死信落盘与提交位推进之间崩溃（两个文件不是一次事务）。
+
+  扫描时凡是命中 `retries.json` 里的**死信位移**，一律跳过且不投递给消费者，
+  投递游标与连续前缀提交位都可以**越过**该死信继续推进。因此：
+
+  - 已经进死信的那条消息**不会**被当成新消息再投一遍，`Attempt` 不会从 1 重来，
+    同一份消息也**不会**重复产生死信记录（同 `(组,分区,位移)` 死信去重）；
+  - 死信**前面**尚未确认的普通消息仍按 at-least-once 正常重投，死信**后面**
+    从未投递过的消息正常首发——不会为了避开死信而卡住提交位，也不会跳过活消息；
+  - 想让该死信的内容再被处理，唯一途径是第 5 节的**显式死信重投**
+    （在日志尾部追加一条新位移的新消息），而不是复活原位移。
 
 ## 4. 失败重试与死信
 
@@ -127,8 +163,11 @@ go test -race -count=1 -run 'Replay' ./...
     退避未到期前，同分区后续消息也不会越过它（顺序不被破坏、不重复入队）。
   - 达到上限：消息连同**完整快照**与**每次失败的原因链**进入死信，
     `Nack` 返回 `ErrRetryExhausted` 以便与“已安排重试”区分。
-- 死信为终态：该位移从待重试集合移除，连续前缀提交可以越过它继续推进，
-  分区不会被一条毒消息永久阻塞；`DeadLetters(group)` 可读取死信与原因链。
+- 死信为终态：该位移从待重试集合移除，扫描时被显式跳过（见 3.3），
+  连续前缀提交可以越过它继续推进，分区不会被一条毒消息永久阻塞；
+  该终态在重启、租约过期接管、任何游标回退后都保持不变。
+  `DeadLetters(group)` 可读取死信与原因链；同一 `(组,分区,位移)` 的死信
+  在持久层做了去重，任何异常路径都不会让同一份消息重复产生第二条死信记录。
 
   > **兼容性说明**：对“消费位移”而言死信仍是终态——原位移不会被复活、提交位
   > 不回退。第 5 节的**死信重投**提供的是另起一条新日志记录的“再投递”能力，
@@ -153,7 +192,22 @@ go test -race -count=1 -run 'Replay' ./...
   沿用消费组独占、心跳租约与会话代次栅栏；同分区同一时刻仍只有一个消费者处理。
 - **重新获得完整重试机会**：重投副本的 `Attempt` 从 1 重新计数，再次失败仍按
   同一套确定性退避（`BaseDelay * Multiplier^(attempt-1)`、`MaxAttempts`）处理；
-  再次超过上限，会作为一条**新的死信记录**再次进死信，并且还能再次被重投。
+  再次超过上限，会作为一条**新的死信记录**（新位移、新一轮原因链）再次进死信，
+  并且还能再次被重投。完整生命周期：
+
+  ```
+  原消息(offset O) 失败超限
+    -> 死信#1（位移 O 终态，永不再投；只有显式重投才能再处理其内容）
+    -> ReplayDeadLetters：在尾部追加副本(offset N)，Attempt 重置，溯源 round=1
+    -> 副本再次失败超限
+    -> 死信#2（位移 N，新一条记录；原死信#1 与位移 O 的终态都不受影响）
+    -> 再次 ReplayDeadLetters：尾部再追加副本(offset M)，溯源 round=2，
+       Origin* 始终指向“最初来源” offset O
+    -> …可继续重复；每一轮都是新位移、新死信、round 递增，旧位移永不复活
+  ```
+
+  对应回归用例：`TestReplayFailAgain`（再次失败/再次死信/再次重投、round 递增）、
+  `TestReplayOrderingRegression`（位移不回退、不复活、栅栏不回归）。
 
 ### 5.2 溯源：失败原因、次数与原始来源完整保留
 
@@ -202,6 +256,12 @@ prov, ok := mq.ParseReplayProvenance(d.Record.Headers) // 解析重投副本溯�
 
 ### 5.4 并发、容量与崩溃下的正确性
 
+- **并发触发 / 续跑 / 查询安全一致**：触发、续跑在 Broker 串行区完成；
+  重投账本有自己的读写锁，`GetReplay/ListReplays` 等只读查询可与写并发执行，
+  `-race` 下无数据竞争。所有对外返回的操作都是**深拷贝快照**，并保证
+  status 与每条 item 状态自洽——查询到的要么是推进前的完整状态、要么是
+  推进后的完整状态，绝不会读到“操作已 complete 但某条 item 还是中间态”这类
+  撕裂数据。并发用同一幂等键触发只会收敛到同一个操作、同一批副本。
 - **反压**：重投入队受分区容量（`PartCapacity`）约束；入队后的消费同样受
   `MaxInflight` 在途窗口约束。装不下时 `ReplayDeadLetters/ResumeReplay`
   立即返回 `ErrQueueFull`——已入队部分不回滚，操作停在 `pending`，**不静默丢弃、

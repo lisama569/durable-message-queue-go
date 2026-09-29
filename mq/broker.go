@@ -151,6 +151,20 @@ func (b *Broker) getLogLocked(tp TopicPartition) (*PartitionLog, bool) {
 	return l, ok
 }
 
+// readRecordLocked 从分区日志读取记录，并回填 Topic/Partition。
+// 磁盘记录体只持久化 offset 与消息内容（topic/partition 由文件路径隐含），
+// 因此从日志恢复出的 Record 必须补上路由身份，否则基于 Record.Topic 的
+// 属主校验、位移键、重投溯源等都会拿到空主题。
+func (b *Broker) readRecordLocked(tp TopicPartition, offset int64) (Record, bool) {
+	rec, ok := b.logs[tp].Read(offset)
+	if !ok {
+		return Record{}, false
+	}
+	rec.Topic = tp.Topic
+	rec.Partition = tp.Partition
+	return rec, true
+}
+
 // Produce 向分区尾部顺序追加一条消息（先持久化再返回，保证不丢）。
 func (b *Broker) Produce(tp TopicPartition, m Message) (int64, error) {
 	b.mu.Lock()
@@ -170,12 +184,11 @@ func (b *Broker) Produce(tp TopicPartition, m Message) (int64, error) {
 // ReadRecord 按位移读取记录（便于测试与重放）。
 func (b *Broker) ReadRecord(tp TopicPartition, offset int64) (Record, bool) {
 	b.mu.Lock()
-	l, ok := b.logs[tp]
-	b.mu.Unlock()
-	if !ok {
+	defer b.mu.Unlock()
+	if _, ok := b.logs[tp]; !ok {
 		return Record{}, false
 	}
-	return l.Read(offset)
+	return b.readRecordLocked(tp, offset)
 }
 
 // JoinGroup 注册消费者并返回句柄。
@@ -217,7 +230,9 @@ func (b *Broker) expire(now time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for name, g := range b.groups {
-		// 找出过期前的成员，回收其在途
+		// 必须在 expireLeases 删除成员【之前】快照过期成员 id，
+		// 否则过期成员已被移除，下面的在途回收会回收不到任何消息，
+		// 旧主未确认消息（含其投递游标）便无法正确地交给新主。
 		dead := b.expiredMembersLocked(g, now)
 		if g.expireLeases(now) {
 			for _, id := range dead {
@@ -309,6 +324,8 @@ func (b *Broker) Poll(c *Consumer, max int) ([]Delivery, error) {
 			// 非持有者/旧代次是正常情形：跳过该分区，不报错中断整批。
 			continue
 		}
+		// 本分区此刻无消息也继续扫描后续分区（collectLocked 可能返回空，
+		// 例如被在途窗口或退避顶住），不会因为某个分区暂空而漏掉别的分区。
 		out = append(out, b.collectLocked(g.name, c, tp, l, max-len(out), now)...)
 	}
 	if len(out) > 0 {
@@ -338,6 +355,9 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 		hi = committed
 		b.deliveredHi[key] = hi
 	}
+	// 死信位移是终态：无论游标因重启、接管还是任何回退落到它们之前，
+	// 都只能跳过（并推进投递游标），绝不允许作为新消息再次投出。
+	dead := b.retries.deadOffsets(groupName, tp)
 	var out []Delivery
 
 	// 1) 先重新投递退避已到期的重试消息（其位移必然 < hi 且当前不在途）。
@@ -351,7 +371,11 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 		if _, busy := set[e.Offset]; busy {
 			continue
 		}
-		rec, exists := l.Read(e.Offset)
+		if _, isDead := dead[e.Offset]; isDead {
+			// 防御性：死信与待重试互斥，绝不能把终态死信当重试再投。
+			continue
+		}
+		rec, exists := b.readRecordLocked(tp, e.Offset)
 		if !exists {
 			continue
 		}
@@ -376,13 +400,22 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 			// 到期情况已在上面处理，且它必已投递过（off < hi），不在此首发。
 			break
 		}
+		if _, isDead := dead[off]; isDead {
+			// 死信终态：跳过该位移但不阻塞后续消息。投递游标随之越过它，
+			// 连续前缀提交也可以越过死信继续推进——既不复活死信，也不卡住提交位。
+			hi = off + 1
+			b.deliveredHi[key] = hi
+			b.logf("[poll-skip-dead] id=%s reason=dead-letter-terminal committed=%s",
+				tp.String()+"#"+itoa64(off), itoa64(committed))
+			continue
+		}
 		// 投递窗口上限即反压信号：不丢弃，留到下次 Poll。
 		if len(set) >= b.cfg.MaxInflight {
 			b.logf("[poll-backpressure] group=%s tp=%s inflight=%d limit=%d offset=%s",
 				groupName, tp.String(), len(set), b.cfg.MaxInflight, itoa64(off))
 			break
 		}
-		rec, exists := l.Read(off)
+		rec, exists := b.readRecordLocked(tp, off)
 		if !exists {
 			break
 		}
@@ -452,6 +485,8 @@ func (b *Broker) Ack(c *Consumer, d Delivery) error {
 
 // advanceContiguousLocked 计算连续已确认前缀并提交。
 // 上界为 deliveredHi：从未投递过的位移绝不允许计入提交。
+// 死信位移是终态空洞：连续前缀可以越过它继续推进，
+// 但它本身永远不会被当作“可再投递”的消息。
 func (b *Broker) advanceContiguousLocked(g *group, c *Consumer,
 	tp TopicPartition, now time.Time) int64 {
 	l, ok := b.logs[tp]
@@ -464,6 +499,7 @@ func (b *Broker) advanceContiguousLocked(g *group, c *Consumer,
 		limit = hi
 	}
 	set := b.inflight[key]
+	dead := b.retries.deadOffsets(g.name, tp)
 	off := g.committedOffset(tp)
 	for off < limit {
 		if _, busy := set[off]; busy {
@@ -471,6 +507,10 @@ func (b *Broker) advanceContiguousLocked(g *group, c *Consumer,
 		}
 		if _, waiting := b.retries.retryState(g.name, tp, off); waiting {
 			break
+		}
+		if _, isDead := dead[off]; isDead {
+			off++ // 死信终态：允许提交位越过，不阻塞后续消息
+			continue
 		}
 		off++
 	}
@@ -594,6 +634,17 @@ func (b *Broker) Assignments(groupName string) map[TopicPartition]string {
 // DeadLetters 读取某组的死信记录。
 func (b *Broker) DeadLetters(groupName string) []DLQEntry {
 	return b.retries.deadLetters(groupName)
+}
+
+// CommittedOffset 返回某消费组在给定分区上的已提交位移（只读可观测）。
+func (b *Broker) CommittedOffset(groupName string, tp TopicPartition) (int64, bool) {
+	b.mu.Lock()
+	g, ok := b.groups[groupName]
+	b.mu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return g.committedOffset(tp), true
 }
 
 // ReplayDeadLetters 触发某消费组的死信重投（按 filter 筛选）。
@@ -768,7 +819,7 @@ func (b *Broker) findReplayRecordLocked(l *PartitionLog, opID string,
 	tp TopicPartition, originOffset, scanFrom int64) (Record, int64, bool) {
 	end := l.endOffset()
 	for off := scanFrom; off < end; off++ {
-		rec, ok := l.Read(off)
+		rec, ok := b.readRecordLocked(tp, off)
 		if !ok {
 			continue
 		}

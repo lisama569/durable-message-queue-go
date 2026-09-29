@@ -146,7 +146,20 @@ func (s *retryStore) schedule(e retryEntry, rec Record, policy RetryPolicy, now 
 			Reasons:   reasons,
 			DeadAt:    now,
 		}
-		s.dead[e.Group] = append(s.dead[e.Group], dlq)
+		// 同（组,分区,位移）的死信必须只有一条：死信是终态，正常流程下
+		// 投递扫描不会把该位移再次投出，这里再做一层防御性去重，
+		// 避免任何异常路径下同一份消息重复产生死信记录。
+		if i := s.findDeadIndexLocked(e.Group, e.tp(), e.Offset); i >= 0 {
+			// 已存在死信：保留其重投认领标记（重投账本的一致性依赖它），
+			// 仅更新快照、次数、原因链与进死信时间。
+			existing := s.dead[e.Group][i]
+			dlq.ReplayedOpID = existing.ReplayedOpID
+			dlq.ReplayedAt = existing.ReplayedAt
+			dlq.ReplayedNewOffset = existing.ReplayedNewOffset
+			s.dead[e.Group][i] = dlq
+		} else {
+			s.dead[e.Group] = append(s.dead[e.Group], dlq)
+		}
 		if err := s.persistLocked(); err != nil {
 			return err
 		}
@@ -203,6 +216,21 @@ func (s *retryStore) deadLetters(group string) []DLQEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := append([]DLQEntry(nil), s.dead[group]...)
+	return out
+}
+
+// deadOffsets 返回某组在给定分区上【已经处于死信终态】的位移集合。
+// 这些位移在任何重启、接管或游标回退之后都必须保持终态：
+// 投递扫描遇到它们时只能跳过（并允许连续前缀提交越过），绝不能再投出来。
+func (s *retryStore) deadOffsets(group string, tp TopicPartition) map[int64]struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[int64]struct{}{}
+	for _, e := range s.dead[group] {
+		if e.Topic == tp.Topic && e.Partition == tp.Partition {
+			out[e.Offset] = struct{}{}
+		}
+	}
 	return out
 }
 

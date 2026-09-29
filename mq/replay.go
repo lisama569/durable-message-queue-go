@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -105,8 +106,13 @@ type replayState struct {
 }
 
 // replayStore 持久化重投操作账本（replays.json，临时文件 + 原子 rename）。
-// 账本的所有变更都在 Broker 的互斥锁串行区里完成，因此这里不再单独加锁。
+//
+// 所有变更都由 Broker 的互斥锁串行化；本结构额外持有自己的 mu，
+// 使 GetReplay/ListReplays 等只读查询可以与“触发/续跑”并发执行而不发生
+// 数据竞争。所有对外返回的操作均为深拷贝快照：查询到的要么是推进前的
+// 完整状态、要么是推进后的完整状态，绝不会看到条目更新一半的中间态。
 type replayStore struct {
+	mu   sync.Mutex
 	path string
 	ops  map[string]*ReplayOperation
 }
@@ -147,6 +153,8 @@ func (s *replayStore) clone(op *ReplayOperation) ReplayOperation {
 }
 
 func (s *replayStore) getOp(opID string) (ReplayOperation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	op, ok := s.ops[opID]
 	if !ok {
 		return ReplayOperation{}, false
@@ -155,6 +163,8 @@ func (s *replayStore) getOp(opID string) (ReplayOperation, bool) {
 }
 
 func (s *replayStore) findByIdempotency(group, key string) (ReplayOperation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, op := range s.ops {
 		if op.Group == group && op.IdempotencyKey == key {
 			return s.clone(op), true
@@ -164,6 +174,8 @@ func (s *replayStore) findByIdempotency(group, key string) (ReplayOperation, boo
 }
 
 func (s *replayStore) listOps(group string) []ReplayOperation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var out []ReplayOperation
 	for _, op := range s.ops {
 		if op.Group == group {
@@ -197,6 +209,8 @@ func newOpID(now time.Time, seq int64) string {
 func (s *replayStore) createReplay(rs *retryStore, group, idemKey string,
 	candidates []DLQEntry, now time.Time, seq int64) (*ReplayOperation, []DLQEntry) {
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	op := &ReplayOperation{
 		OpID:           newOpID(now, seq),
 		Group:          group,
@@ -245,6 +259,8 @@ func (s *replayStore) createReplay(rs *retryStore, group, idemKey string,
 
 // markReserved 把条目置为“已预留位移、即将写日志”。
 func (s *replayStore) markReserved(opID string, item ReplayItem, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	op, ok := s.ops[opID]
 	if !ok {
 		return false
@@ -268,6 +284,8 @@ func (s *replayStore) markReserved(opID string, item ReplayItem, now time.Time) 
 
 // markEnqueued 把条目置为完成并记录新位移；全部完成时操作整体置 complete。
 func (s *replayStore) markEnqueued(opID string, item ReplayItem, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	op, ok := s.ops[opID]
 	if !ok {
 		return false
@@ -299,6 +317,8 @@ func (s *replayStore) markEnqueued(opID string, item ReplayItem, now time.Time) 
 
 // markItemError 记录条目本次推进失败原因（不改变其 pending 状态，可稍后重试）。
 func (s *replayStore) markItemError(opID string, item ReplayItem, msg string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	op, ok := s.ops[opID]
 	if !ok {
 		return
@@ -319,6 +339,8 @@ func (s *replayStore) markItemError(opID string, item ReplayItem, msg string, no
 // 这对应“认领标记已落盘、但操作账本尚未落盘就崩溃”的窗口；补出的操作
 // 在 Resume 时通过日志尾部探测保证不重复入队。
 func (s *replayStore) reconcile(rs *retryStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	changed := false
 	for _, g := range rs.groupNames() {
 		for _, e := range rs.claimedDead(g) {
@@ -367,6 +389,7 @@ func (s *replayStore) opExistsForClaim(opID string, e DLQEntry) bool {
 	return false
 }
 
+// persistLocked 原子落盘账本；调用方必须持有 s.mu。
 func (s *replayStore) persistLocked() error {
 	st := replayState{Ops: make([]ReplayOperation, 0, len(s.ops))}
 	for _, op := range s.ops {

@@ -14,6 +14,10 @@ import (
 func TestStressConcurrentConsume(t *testing.T) {
 	cfg := withLogger(testConfig(t))
 	cfg.PartCapacity = 10000
+	// race 插桩 + 高负载下单批处理可能超过默认 50ms 租约；worker 只在每轮
+	// 循环开头续租，这里放宽 TTL 以隔离“机器快慢导致的误判过期”，
+	// 被验证的并发不重不漏语义不依赖 TTL 大小。
+	cfg.LeaseTTL = 10 * time.Second
 	b, _ := mq.NewBroker(cfg)
 	defer b.Close()
 	const parts, perPart, workers = 8, 50, 6

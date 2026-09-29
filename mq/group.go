@@ -112,23 +112,23 @@ func newGroup(name, dir string, leaseTTL time.Duration, clock Clock) (*group, er
 // tpKey 的编码与 TopicPartition.String 一致：topic-partition。
 func tpKey(tp TopicPartition) string { return tp.String() }
 
+// parseTPKey 是 tpKey 的逆运算。
+// 键的格式为 "<topic>-<partition>"，但主题名本身允许包含 '-'，因此不能简单
+// 按最后一个 '-' 切分（例如 topic="t" 时旧逻辑把 "t-0" 切成空前缀 + "t-0"，
+// 整数解析失败又退化成只看最后一个 '-'，最终主题丢空、重启后提交位移读不回）。
+// 规则：从右向左找第一个“其右侧是合法分区整数、且左侧主题非空”的 '-'。
 func parseTPKey(s string) (TopicPartition, bool) {
-	i := -1
-	// 找最后一个 '-'，因为 topic 名可能含 '-'。
-	for j := len(s) - 1; j >= 0; j-- {
-		if s[j] == '-' {
-			i = j
-			break
+	for i := len(s) - 1; i > 0; i-- {
+		if s[i] != '-' {
+			continue
 		}
+		n, err := parseInt(s[i+1:])
+		if err != nil {
+			continue
+		}
+		return TopicPartition{Topic: s[:i], Partition: n}, true
 	}
-	if i < 0 {
-		return TopicPartition{}, false
-	}
-	n, err := parseInt(s[i+1:])
-	if err != nil {
-		return TopicPartition{}, false
-	}
-	return TopicPartition{Topic: s[:i], Partition: n}, true
+	return TopicPartition{}, false
 }
 
 func parseInt(s string) (int, error) {
@@ -166,9 +166,10 @@ func (g *group) register(id string) (*Consumer, error) {
 	now := g.clock.Now()
 	g.members[id] = &member{id: id, gen: g.generation, lastHeartbeat: now}
 	// 成员加入不推进全局代次：现有持有者的分区不被撤销，
-	// 新成员只参与后续无主分区的分配。代次仅在成员离开/过期时推进，
-	// 但比较的是“会话令牌”（成员注册时的代次），因此再平衡只隔离
-	// 离开/过期的那个会话，不波及其余存活成员。
+	// 新成员只参与后续无主分区（或其属主会话已失效的分区，见 ensureOwner）
+	// 的分配。代次仅在成员离开/过期时推进；比较的是“会话令牌”
+	// （成员注册时的代次），因此再平衡只隔离离开/过期的那个会话，
+	// 不波及其余存活成员。
 	c := &Consumer{id: id, group: g, gen: g.generation}
 	if err := g.persistLocked(); err != nil {
 		delete(g.members, id)
@@ -291,11 +292,17 @@ func (g *group) ensureOwner(c *Consumer, tp TopicPartition, allTP []TopicPartiti
 	if now.Sub(m.lastHeartbeat) > g.leaseTTL {
 		return ErrLeaseExpired
 	}
-	if o, owned := g.owners[tp]; owned {
-		if o.ConsumerID != c.id {
+	if o, owned := g.owners[tp]; owned && o.ConsumerID != c.id {
+		// 属主是别人：只有在该属主会话已经失效（成员已离开/被过期清除，
+		// 或其心跳已超过租约）时，才摘除陈旧属主并触发重新分配——
+		// 这覆盖“备机先在组内、旧主心跳超时后由备机 Poll 接管”的路径。
+		om, alive := g.members[o.ConsumerID]
+		stale := !alive || now.Sub(om.lastHeartbeat) > g.leaseTTL
+		if !stale {
 			return ErrPartitionOwned
 		}
-		// 持有者就是自己：粘滞保留；是否过期由上面的成员心跳判断。
+		delete(g.owners, tp)
+		g.assignLocked(allTP, now)
 	}
 	if _, owned := g.owners[tp]; !owned {
 		g.assignLocked(allTP, now)
