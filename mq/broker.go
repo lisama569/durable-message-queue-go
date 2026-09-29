@@ -332,13 +332,16 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 	g := b.groups[groupName]
 	committed := g.committedOffset(tp)
 	end := l.endOffset()
-	// 投递游标：首次访问（或重启后）从已提交位开始；正常推进中只增不减。
+	// 投递游标：首次访问（或重启/接管回退后）从已提交位开始；正常推进中只增不减。
 	hi, started := b.deliveredHi[key]
 	if !started || hi < committed {
 		hi = committed
 		b.deliveredHi[key] = hi
 	}
 	var out []Delivery
+	// 本轮扫描是否越过了死信终态位移；越过之后即便没有新投递，
+	// 也要尝试把连续前缀提交位推过去，避免“为避开死信而卡住提交位”。
+	terminalSkipped := false
 
 	// 1) 先重新投递退避已到期的重试消息（其位移必然 < hi 且当前不在途）。
 	for _, e := range b.retries.due(groupName, now) {
@@ -346,6 +349,10 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 			break
 		}
 		if e.tp() != tp || e.Offset < committed || e.Offset >= end {
+			continue
+		}
+		// 防御：终态死信绝不走重投路径（正常状态机下待重试与死信互斥）。
+		if _, dead := b.retries.deadState(groupName, tp, e.Offset); dead {
 			continue
 		}
 		if _, busy := set[e.Offset]; busy {
@@ -364,6 +371,19 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 	// 2) 从投递游标 hi 起顺序首发新消息；遇到在途或退避未到期消息必须停住，
 	//    保证“同分区顺序稳定”、不跳过未决消息。
 	for off := hi; off < end && len(out) < budget; off++ {
+		// 死信终态：该位移已经投递并失败到上限，持久化的死信记录即终态标记。
+		// 任何重启、租约过期接管、游标回退到已提交位的场景下都只跳过、不投递；
+		// 只有显式 ReplayDeadLetters 在日志尾部另立的【新记录】才会再被消费。
+		// 游标随跳过一并推进：死信位移此前必然已经投递过，推进它不会把
+		// 从未投递的消息静默跳掉。
+		if _, dead := b.retries.deadState(groupName, tp, off); dead {
+			b.logf("[poll-skip-dlq] id=%s#%s reason=dead-letter-terminal",
+				tp.String(), itoa64(off))
+			hi = off + 1
+			b.deliveredHi[key] = hi
+			terminalSkipped = true
+			continue
+		}
 		if _, busy := set[off]; busy {
 			break // 窗口内有未确认消息：保持顺序，停止首发推进
 		}
@@ -390,6 +410,14 @@ func (b *Broker) collectLocked(groupName string, c *Consumer, tp TopicPartition,
 		out = append(out, d)
 		hi = off + 1
 		b.deliveredHi[key] = hi
+	}
+
+	// 重启/接管后可能出现：连续前缀里夹着此前已进死信的位移（其左侧的未确认
+	// 消息刚刚在接管后被重新确认），而本轮没有新的 Ack 发生。越过终态后主动
+	// 补一次连续前缀提交，保证提交位不会为了避开死信而永久卡住；前方仍有
+	// 在途/待重试消息时该函数自然停在那里，不会越过未决消息。
+	if terminalSkipped {
+		b.advanceContiguousLocked(g, c, tp, now)
 	}
 	return out
 }
@@ -786,7 +814,11 @@ func (b *Broker) findReplayRecordLocked(l *PartitionLog, opID string,
 }
 
 // GetReplay 查询单个重投操作的当前状态（重启后亦可查询）。
+// 查询在 Broker 互斥区内完成：与触发/续跑严格串行，返回的快照要么是
+// 推进前的完整状态，要么是推进后的完整状态，绝不会读到半更新的中间态。
 func (b *Broker) GetReplay(opID string) (ReplayOperation, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if op, ok := b.replays.getOp(opID); ok {
 		return op, nil
 	}
@@ -794,6 +826,9 @@ func (b *Broker) GetReplay(opID string) (ReplayOperation, error) {
 }
 
 // ListReplays 列出某消费组的全部重投操作（含已完成与未完成），按创建时间排序。
+// 与 GetReplay 同样在 Broker 互斥区内取快照，并发触发/续跑下安全一致。
 func (b *Broker) ListReplays(groupName string) []ReplayOperation {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.replays.listOps(groupName)
 }

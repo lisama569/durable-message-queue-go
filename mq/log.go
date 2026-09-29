@@ -84,7 +84,13 @@ func (l *PartitionLog) recoverLocked() error {
 		}
 		var rec Record
 		if err := decodeRecord(data[off:off+n], &rec); err != nil {
-			break // 损坏记录：保守截断
+			// 兼容旧版本日志（记录体不含主题/分区字段）：按旧布局再解一次，
+			// 主题/分区用本日志已知的 l.tp 回填，保证升级后老数据可读、可 Ack。
+			if err2 := decodeRecordLegacy(data[off:off+n], &rec); err2 != nil {
+				break // 新旧布局都解不开：损坏记录，保守截断
+			}
+			rec.Topic = l.tp.Topic
+			rec.Partition = l.tp.Partition
 		}
 		if rec.Offset != int64(len(l.recs)) {
 			break // 位移不连续：保守截断
@@ -215,6 +221,8 @@ func encodeRecord(r Record) []byte {
 	var b bytes.Buffer
 	putInt64(&b, r.Offset)
 	putInt64(&b, r.EnqueuedAt.UnixNano())
+	putString(&b, r.Topic)
+	putInt64(&b, int64(r.Partition))
 	putBytes(&b, r.Key)
 	putBytes(&b, r.Value)
 	putInt64(&b, int64(len(r.Headers)))
@@ -264,6 +272,16 @@ func decodeRecord(data []byte, r *Record) error {
 		return ErrInvalidArgument
 	}
 	r.EnqueuedAt = time.Unix(0, tsNano)
+	if topic, ok := getString(data, &off); !ok {
+		return ErrInvalidArgument
+	} else {
+		r.Topic = topic
+	}
+	pn, ok := getInt64(data, &off)
+	if !ok {
+		return ErrInvalidArgument
+	}
+	r.Partition = int(pn)
 	if r.Key, ok = getBytes(data, &off); !ok {
 		return ErrInvalidArgument
 	}
@@ -284,6 +302,50 @@ func decodeRecord(data []byte, r *Record) error {
 			}
 			r.Headers[k] = v
 		}
+	}
+	// 必须恰好消费完整条记录体，否则可能是旧格式被误当新格式解出半截。
+	if off != len(data) {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
+// decodeRecordLegacy 解码旧版本记录布局：offset、enqueuedAt 之后直接是
+// Key/Value/Headers（不含主题与分区）；主题/分区由 recoverLocked 回填。
+func decodeRecordLegacy(data []byte, r *Record) error {
+	off := 0
+	var ok bool
+	if r.Offset, ok = getInt64(data, &off); !ok {
+		return ErrInvalidArgument
+	}
+	tsNano, ok := getInt64(data, &off)
+	if !ok {
+		return ErrInvalidArgument
+	}
+	r.EnqueuedAt = time.Unix(0, tsNano)
+	if r.Key, ok = getBytes(data, &off); !ok {
+		return ErrInvalidArgument
+	}
+	if r.Value, ok = getBytes(data, &off); !ok {
+		return ErrInvalidArgument
+	}
+	hN, ok := getInt64(data, &off)
+	if !ok || hN < 0 {
+		return ErrInvalidArgument
+	}
+	if hN > 0 {
+		r.Headers = make(map[string]string, hN)
+		for i := int64(0); i < hN; i++ {
+			k, ok1 := getString(data, &off)
+			v, ok2 := getString(data, &off)
+			if !ok1 || !ok2 {
+				return ErrInvalidArgument
+			}
+			r.Headers[k] = v
+		}
+	}
+	if off != len(data) {
+		return ErrInvalidArgument
 	}
 	return nil
 }

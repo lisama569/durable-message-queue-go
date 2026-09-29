@@ -14,6 +14,10 @@ import (
 func TestStressConcurrentConsume(t *testing.T) {
 	cfg := withLogger(testConfig(t))
 	cfg.PartCapacity = 10000
+	// -race 会显著放大 goroutine 调度延迟，默认 50ms 租约在压力下可能误判过期，
+	// 导致在途回收与计数抖动；该用例验证的是并发不丢不重而非租约语义，
+	// 这里放宽租约（租约过期另有 TestLeaseExpiryRebalance 专门覆盖）。
+	cfg.LeaseTTL = 10 * time.Second
 	b, _ := mq.NewBroker(cfg)
 	defer b.Close()
 	const parts, perPart, workers = 8, 50, 6

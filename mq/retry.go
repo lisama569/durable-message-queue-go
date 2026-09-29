@@ -130,6 +130,12 @@ func (s *retryStore) schedule(e retryEntry, rec Record, policy RetryPolicy, now 
 	defer s.mu.Unlock()
 
 	if e.Attempt >= policy.MaxAttempts {
+		// 终态去重：同一个 (组, 分区, 位移) 只允许有一条死信记录。
+		// 正常状态机下不会走到这里（死信位移不会再被投递）；该保护确保
+		// 即便出现异常再投，同一份消息也不会重复入死信、重复计数。
+		if i := s.findDeadIndexLocked(e.Group, e.tp(), e.Offset); i >= 0 {
+			return ErrRetryExhausted
+		}
 		// 进入死信：合并同一条消息此前的失败原因，保留完整原因链。
 		reasons := []string{e.LastReason}
 		if old, ok := s.findLocked(e.Group, e.tp(), e.Offset); ok {
@@ -197,6 +203,19 @@ func (s *retryStore) retryState(group string, tp TopicPartition, offset int64) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.findLocked(group, tp, offset)
+}
+
+// deadState 查询某条记录是否已经进入死信。死信是【持久化终态】：
+// 无论重启、租约过期接管还是投递游标回退到已提交位，命中的原位移都
+// 绝不允许再次作为普通消息投出，除非通过显式重投在日志尾部另立新记录。
+func (s *retryStore) deadState(group string, tp TopicPartition, offset int64) (DLQEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.findDeadIndexLocked(group, tp, offset)
+	if i < 0 {
+		return DLQEntry{}, false
+	}
+	return s.dead[group][i], true
 }
 
 func (s *retryStore) deadLetters(group string) []DLQEntry {
